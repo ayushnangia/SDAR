@@ -237,29 +237,15 @@ def run_aime24_benchmark(
 
     # Run evaluation with multiple attempts per problem
     print("\n[5/5] Running evaluation...")
-    problem_results = []
-    total_gen_time = 0.0
 
-    # Create progress bar
-    pbar = tqdm(
-        total=len(dataset),
-        desc="AIME Eval",
-        unit="problem",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-    )
+    # Step 1: Prepare all prompts and metadata upfront
+    print("Preparing prompts...")
+    all_requests = []  # List of (problem_idx, run_idx, prompt, problem_data)
 
-    # Process each problem with batched runs
     for problem_idx, example in enumerate(dataset):
         problem_id = example.get("id", problem_idx)
         problem_text = example.get("problem", "")
         ground_truth = example.get("answer", "")
-
-        if verbose:
-            print(f"\n{'='*80}")
-            print(f"Problem {problem_idx + 1}/{len(dataset)} (ID: {problem_id})")
-            print(f"{'='*80}")
-            print(f"Problem: {problem_text[:200]}..." if len(problem_text) > 200 else f"Problem: {problem_text}")
-            print(f"Ground truth: {ground_truth}")
 
         # Format prompt (same for all runs of this problem)
         prompt_text = format_prompt_aime(problem_text, include_instruction=True)
@@ -270,97 +256,130 @@ def run_aime24_benchmark(
             tokenize=False
         )
 
-        # Process runs in batches to avoid memory issues with large num_runs
-        # Batch size of 16 balances throughput and memory usage
-        batch_size = 16
-        attempts = []
-        total_problem_time = 0.0
-
-        try:
-            # Process runs in batches
-            for batch_start in range(0, num_runs, batch_size):
-                batch_end = min(batch_start + batch_size, num_runs)
-                current_batch_size = batch_end - batch_start
-
-                # Create batch of identical prompts (sampling will give different outputs)
-                batch_prompts = [formatted_prompt] * current_batch_size
-
-                # Generate batch
-                batch_gen_start = time.time()
-                batch_outputs = llm.generate_streaming(
-                    batch_prompts,
-                    sampling_params,
-                    max_active=256,
-                    use_tqdm=False
-                )
-                batch_gen_time = time.time() - batch_gen_start
-                total_problem_time += batch_gen_time
-
-                # Process each run's output in this batch
-                for batch_idx, output in enumerate(batch_outputs):
-                    run_idx = batch_start + batch_idx
-                    output_text = output['text']
-                    cleaned_text = output_text.replace('<|MASK|>', '')
-
-                    # Extract answer (integer 0-999)
-                    predicted_answer = extract_answer_aime(cleaned_text)
-
-                    # Evaluate
-                    is_correct = evaluate_answer_aime(predicted_answer, ground_truth)
-
-                    # Calculate token metrics (approximate per-run time)
-                    output_len = len(tokenizer.encode(output_text))
-                    approx_run_time = batch_gen_time / current_batch_size
-                    tokens_per_sec = output_len / approx_run_time if approx_run_time > 0 else 0
-
-                    if verbose:
-                        print(f"\n  Run {run_idx + 1}/{num_runs}:")
-                        print(f"    Generated ({output_len} tokens)")
-                        print(f"    Predicted: {predicted_answer}")
-                        print(f"    Correct: {'✓' if is_correct else '✗'}")
-
-                    # Store attempt
-                    attempt = {
-                        "run_number": run_idx,
-                        "predicted_answer": predicted_answer,
-                        "correct": is_correct,
-                        "generated_text": cleaned_text,
-                        "generation_time_seconds": approx_run_time,
-                        "tokens_per_second": tokens_per_sec,
-                        "output_tokens": output_len,
-                    }
-                    attempts.append(attempt)
-
-                if verbose:
-                    print(f"\n  Batch {batch_start // batch_size + 1} generation time: {batch_gen_time:.2f}s for {current_batch_size} runs")
-
-            total_gen_time += total_problem_time
-
-            if verbose:
-                print(f"\n  Total problem time: {total_problem_time:.2f}s for {num_runs} runs")
-                print(f"  Average per run: {total_problem_time / num_runs:.2f}s")
-
-        except Exception as e:
-            print(f"\n  ✗ Error generating batch for problem {problem_idx}: {e}")
-            import traceback
-            if verbose:
-                traceback.print_exc()
-
-            # Create failed attempts
-            attempts = []
-            for run_idx in range(num_runs):
-                attempts.append({
-                    "run_number": run_idx,
-                    "predicted_answer": None,
-                    "correct": False,
-                    "error": str(e),
-                })
-
-        # Store problem result
-        problem_result = {
+        problem_data = {
             "problem_id": problem_id,
             "problem_text": problem_text,
             "ground_truth": ground_truth,
+        }
+
+        # Create num_runs copies of this prompt
+        for run_idx in range(num_runs):
+            all_requests.append((problem_idx, run_idx, formatted_prompt, problem_data))
+
+    total_requests = len(all_requests)
+    print(f"Total requests: {total_requests} ({len(dataset)} problems × {num_runs} runs)")
+
+    # Step 2: Process all requests in batches of 16
+    batch_size = 16
+    all_outputs = []  # List of (problem_idx, run_idx, output_data)
+    total_gen_time = 0.0
+
+    # Create progress bar
+    pbar = tqdm(
+        total=total_requests,
+        desc="AIME Eval",
+        unit="gen",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+
+    for batch_start in range(0, total_requests, batch_size):
+        batch_end = min(batch_start + batch_size, total_requests)
+        batch_requests = all_requests[batch_start:batch_end]
+
+        # Extract prompts for this batch
+        batch_prompts = [req[2] for req in batch_requests]
+
+        try:
+            # Generate batch
+            batch_gen_start = time.time()
+            batch_outputs = llm.generate_streaming(
+                batch_prompts,
+                sampling_params,
+                max_active=256,
+                use_tqdm=False
+            )
+            batch_gen_time = time.time() - batch_gen_start
+            total_gen_time += batch_gen_time
+
+            # Process each output
+            for i, output in enumerate(batch_outputs):
+                problem_idx, run_idx, _, problem_data = batch_requests[i]
+
+                output_text = output['text']
+                cleaned_text = output_text.replace('<|MASK|>', '')
+
+                # Extract answer (integer 0-999)
+                predicted_answer = extract_answer_aime(cleaned_text)
+
+                # Evaluate
+                is_correct = evaluate_answer_aime(predicted_answer, problem_data["ground_truth"])
+
+                # Calculate token metrics
+                output_len = len(tokenizer.encode(output_text))
+                approx_time = batch_gen_time / len(batch_prompts)
+                tokens_per_sec = output_len / approx_time if approx_time > 0 else 0
+
+                output_data = {
+                    "predicted_answer": predicted_answer,
+                    "correct": is_correct,
+                    "generated_text": cleaned_text,
+                    "generation_time_seconds": approx_time,
+                    "tokens_per_second": tokens_per_sec,
+                    "output_tokens": output_len,
+                }
+
+                all_outputs.append((problem_idx, run_idx, output_data))
+                pbar.update(1)
+
+        except Exception as e:
+            print(f"\n✗ Error in batch {batch_start}-{batch_end}: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Create failed outputs for this batch
+            for i, (problem_idx, run_idx, _, _) in enumerate(batch_requests):
+                output_data = {
+                    "predicted_answer": None,
+                    "correct": False,
+                    "error": str(e),
+                }
+                all_outputs.append((problem_idx, run_idx, output_data))
+                pbar.update(1)
+
+    pbar.close()
+
+    # Step 3: Group outputs back by problem
+    print("\nGrouping results by problem...")
+    problem_results = []
+
+    # Initialize results structure
+    problem_map = {}
+    for problem_idx, example in enumerate(dataset):
+        problem_id = example.get("id", problem_idx)
+        problem_text = example.get("problem", "")
+        ground_truth = example.get("answer", "")
+
+        problem_map[problem_idx] = {
+            "problem_id": problem_id,
+            "problem_text": problem_text,
+            "ground_truth": ground_truth,
+            "attempts": [None] * num_runs  # Pre-allocate attempts list
+        }
+
+    # Fill in attempts
+    for problem_idx, run_idx, output_data in all_outputs:
+        output_data["run_number"] = run_idx
+        problem_map[problem_idx]["attempts"][run_idx] = output_data
+
+    # Convert to list and compute pass@k metrics
+    for problem_idx in range(len(dataset)):
+        problem_data = problem_map[problem_idx]
+        attempts = problem_data["attempts"]
+
+        problem_result = {
+            "problem_id": problem_data["problem_id"],
+            "problem_text": problem_data["problem_text"],
+            "ground_truth": problem_data["ground_truth"],
             "attempts": attempts,
             "passes_at_1": any(a.get('correct', False) for a in attempts[:1]),
             "passes_at_8": any(a.get('correct', False) for a in attempts[:8]),
@@ -368,9 +387,14 @@ def run_aime24_benchmark(
         }
         problem_results.append(problem_result)
 
-        pbar.update(1)
-
-    pbar.close()
+        if verbose:
+            print(f"\nProblem {problem_idx + 1} (ID: {problem_data['problem_id']})")
+            print(f"  Correct attempts: {sum(1 for a in attempts if a.get('correct', False))}/{num_runs}")
+            print(f"  pass@1: {problem_result['passes_at_1']}")
+            if num_runs >= 8:
+                print(f"  pass@8: {problem_result['passes_at_8']}")
+            if num_runs >= 32:
+                print(f"  pass@32: {problem_result['passes_at_32']}")
 
     # Compute final metrics
     print("\n" + "=" * 80)
